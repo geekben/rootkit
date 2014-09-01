@@ -2,6 +2,8 @@
 ##About
 This is sample rootkit implementation for Linux. It is able to hide processes, files and grants root privileges. It also have stealth mode (enabled by default) that prevents it from detecting.
 
+This work is based on Arkadiusz's work 3 years ago: https://github.com/ivyl/rootkit
+
 ##Usage
 Just compile module (included Makefile does this against current kernel) and load it. There will be hidden file in `/proc` called `rtkit`. It's not visible when listing content of proc directory.
 
@@ -29,4 +31,8 @@ http://linux.die.net/lkmpg/
 http://lwn.net/Kernel/LDD3/
 
 ##Authors
-Ivyl and t3hknr.
+Ivyl and t3hknr and Ben.
+
+##New features
+supports 3.11 kernel
+DKOM on process hiding
