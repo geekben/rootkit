@@ -35,4 +35,5 @@ Ivyl and t3hknr and Ben.
 
 ##New features
 supports 3.11 kernel
+
 DKOM on process hiding
