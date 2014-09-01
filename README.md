@@ -31,7 +31,7 @@ http://linux.die.net/lkmpg/
 http://lwn.net/Kernel/LDD3/
 
 ##Authors
-Ivyl and t3hknr and Ben.
+Ivyl and t3hknr and geekben.
 
 ##New features
 supports 3.11 kernel
