@@ -4,6 +4,11 @@ This is sample rootkit implementation for Linux. It is able to hide processes, f
 
 This work is based on Arkadiusz's work 3 years ago: https://github.com/ivyl/rootkit
 
+##New features
+supports 3.11 kernel
+
+DKOM on process hiding
+
 ##Usage
 Just compile module (included Makefile does this against current kernel) and load it. There will be hidden file in `/proc` called `rtkit`. It's not visible when listing content of proc directory.
 
@@ -33,7 +38,4 @@ http://lwn.net/Kernel/LDD3/
 ##Authors
 Ivyl and t3hknr and geekben.
 
-##New features
-supports 3.11 kernel
 
-DKOM on process hiding
